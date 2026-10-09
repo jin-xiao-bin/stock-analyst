@@ -8,6 +8,7 @@
           <span>
             <el-button size="small" @click="openDlg('create')">新建</el-button>
             <el-button size="small" @click="openDlg('import')">粘贴导入</el-button>
+            <el-button size="small" type="warning" plain @click="jqDlg = true">导入聚宽策略</el-button>
             <el-button size="small" type="primary" @click="aiDlg = true">AI生成策略</el-button>
             <el-button size="small" @click="loadList">刷新</el-button>
           </span>
@@ -171,6 +172,26 @@
                    @click="sendChatMsg">发送</el-button>
       </div>
     </el-drawer>
+
+    <!-- 聚宽策略导入对话框 -->
+    <el-dialog v-model="jqDlg" title="导入聚宽(JoinQuant)策略" width="70%" top="4vh">
+      <el-alert type="info" :closable="false" style="margin-bottom: 10px"
+                title="支持直接粘贴 .py 代码或 .ipynb Notebook 的 JSON 源码"
+                description="自动套聚宽兼容层运行（attribute_history/order_target等API自动桥接到单标的沙箱）；失败时 AI 自动改写兜底。多股票选股/组合类策略会被简化为单标的，建议导入后先回测验证。" />
+      <el-form label-width="80px">
+        <el-form-item label="策略名称">
+          <el-input v-model="jqName" placeholder="如：聚宽均线策略" style="width: 300px" />
+        </el-form-item>
+        <el-form-item label="策略代码">
+          <el-input v-model="jqCode" type="textarea" :rows="14" class="code-editor"
+                    placeholder="粘贴聚宽策略代码（initialize/handle_data/调度函数），或整个 .ipynb 的 JSON" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="jqDlg = false">取消</el-button>
+        <el-button type="primary" :loading="jqLoading" @click="doImportJq">导入并适配</el-button>
+      </template>
+    </el-dialog>
 
     <!-- 编辑对话框（新建/导入/编辑） -->
     <el-dialog v-model="editDlg" :title="dlgTitle" width="72%" top="4vh">      <el-form label-width="80px">
@@ -356,6 +377,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import axios from 'axios'
 import { api } from '../api'
 import {
   activateStrategy, applyDiscussionCode, bindStrategy, createStrategy, deactivateStrategy,
@@ -394,6 +416,35 @@ const btDetailMetrics = computed(() => {
     { label: '盈亏比', text: m.profit_factor.toFixed(2), up: undefined },
   ]
 })
+
+// ---------- 聚宽导入 ----------
+const jqDlg = ref(false)
+const jqLoading = ref(false)
+const jqName = ref('')
+const jqCode = ref('')
+
+const doImportJq = async () => {
+  if (!jqCode.value.trim()) { ElMessage.warning('请粘贴聚宽策略代码'); return }
+  jqLoading.value = true
+  try {
+    const r = await api.post('/strategies/import-jq',
+      { code: jqCode.value, name: jqName.value || undefined }).then(x => x.data)
+    const modeText = r.mode === 'shim' ? '兼容层直接运行（未消耗LLM）' : 'AI改写转换'
+    ElMessage.success(`导入成功（${modeText}），策略 #${r.strategy_id}，请先发起回测验证`)
+    jqDlg.value = false
+    jqCode.value = ''
+    jqName.value = ''
+    if (r.warnings?.length) ElMessage.info(r.warnings.join('；'))
+    await loadList()
+  } catch (e) {
+    const msg = axios.isAxiosError(e)
+      ? String((e.response?.data as { detail?: string })?.detail ?? e.message)
+      : (e as Error).message
+    ElMessage({ message: `聚宽适配失败：${msg}`, type: 'error', duration: 8000 })
+  } finally {
+    jqLoading.value = false
+  }
+}
 
 const openBtHistory = async (row: StrategyListItem) => {
   btHistStrategy.value = row

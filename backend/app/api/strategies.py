@@ -65,6 +65,68 @@ class DiscussBody(BaseModel):
     content: str
 
 
+class JqImportBody(BaseModel):
+    code: str
+    name: str | None = None
+
+
+@router.post("/import-jq")
+def import_jq(body: JqImportBody, db: Session = Depends(get_db)):
+    """聚宽策略导入：Notebook/纯Python → 兼容层桥接 → 失败则LLM转换 → 校验入库"""
+    from ..services import jq_adapter
+    from ..services.backtest_engine import validate_strategy_code
+
+    raw = (body.code or "").strip()
+    if not raw:
+        raise HTTPException(400, "代码为空")
+    try:
+        jq_code, fmt = jq_adapter.extract_code(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    if not jq_code.strip():
+        raise HTTPException(400, "未从 Notebook 中抽取到代码 cell")
+
+    name = (body.name or "聚宽导入策略").strip()
+    warnings = []
+
+    # 轨道1：兼容层确定性桥接
+    wrapped = jq_adapter.build_wrapped(jq_code)
+    v = validate_strategy_code(db, wrapped)
+    mode = None
+    final_code = None
+    if v.get("ok"):
+        mode, final_code = "shim", wrapped
+        warnings.append("通过兼容层运行：聚宽API已自动桥接，订单作用于回测标的；"
+                        "多股票选股逻辑已简化为单标的")
+    else:
+        # 轨道2：LLM 转换兜底（失败自动重试一轮）
+        converted = jq_adapter.convert_via_llm(jq_code, str(v.get("error")))
+        for _attempt in range(2):
+            if not converted:
+                break
+            v2 = validate_strategy_code(db, converted)
+            if v2.get("ok"):
+                mode, final_code = "llm", converted
+                break
+            converted = jq_adapter.convert_via_llm(jq_code, str(v2.get("error")))
+        if final_code is None:
+            raise HTTPException(
+                400, (f"聚宽策略适配失败（兼容层报错：{str(v.get('error'))[:150]}；"
+                      f"LLM转换亦未通过校验）。多股票选股/组合类策略受单标的沙箱限制，"
+                      f"请提炼单标的逻辑后用「AI生成策略」描述思路"))
+
+    s = Strategy(
+        name=name, source="import", code=final_code,
+        description=(f"[聚宽适配-{mode}] 输入格式: {fmt}。" + "；".join(warnings)),
+        status="draft")
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return {"strategy_id": s.id, "name": s.name, "mode": mode,
+            "input_format": fmt, "warnings": warnings,
+            "note": "建议先发起回测验证行为是否符合预期"}
+
+
 def _strategy_context(db: Session, s: Strategy) -> str:
     """策略上下文：代码 + 参数 + 最近一次回测指标"""
     bt = db.scalar(select(BacktestRun).where(BacktestRun.strategy_id == s.id)
@@ -210,8 +272,35 @@ def list_strategies(db: Session = Depends(get_db)):
     return [_serialize(s) for s in rows]
 
 
+def _precheck_import(code: str):
+    """导入前置诊断：识别常见不兼容来源，给出明确指引而非晦涩沙箱报错"""
+    c = (code or "").strip()
+    if not c:
+        raise HTTPException(400, "策略代码为空")
+    if c.startswith("{") and '"cells"' in c:
+        raise HTTPException(400,
+                            "检测到 Jupyter Notebook 格式（.ipynb 的 JSON 源码）。"
+                            "请先在 Jupyter 中 File→Export→as .py 导出纯 Python 代码再导入")
+    import re as _re
+    platform_signs = [
+        (r"from jqdata|import jqdata|jqfactor|get_fundamentals|get_index_stocks",
+         "聚宽(JoinQuant)"),
+        (r"from vnpy|import vnpy", "vn.py"),
+        (r"import backtrader|from backtrader", "Backtrader"),
+        (r"set_benchmark|order_target|handle_data\(context", "聚宽/米筐类平台"),
+    ]
+    for pat, name in platform_signs:
+        if _re.search(pat, c):
+            raise HTTPException(
+                400, f"检测到 {name} 平台的策略代码，与本平台沙箱 API 不兼容"
+                     f"（本平台策略只需定义 init(ctx)/on_bar(ctx,bar,i)，"
+                     f"禁用 import 和外部数据接口）。"
+                     f"可通过「AI生成策略」用自然语言描述该策略思路，让 AI 按本平台 API 重写")
+
+
 @router.post("")
 def create_strategy(body: StrategyCreate, db: Session = Depends(get_db)):
+    _precheck_import(body.code)
     v = validate_strategy_code(db, body.code, body.params)
     if not v.get("ok"):
         raise HTTPException(400, f"沙箱校验失败: {v.get('error')}")
@@ -233,6 +322,7 @@ def get_strategy(sid: int, db: Session = Depends(get_db)):
 def update_strategy(sid: int, body: StrategyUpdate, db: Session = Depends(get_db)):
     s = _get_or_404(db, sid)
     if body.code is not None:
+        _precheck_import(body.code)
         v = validate_strategy_code(db, body.code, body.params or s.params)
         if not v.get("ok"):
             raise HTTPException(400, f"沙箱校验失败: {v.get('error')}")

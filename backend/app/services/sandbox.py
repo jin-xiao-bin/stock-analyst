@@ -35,6 +35,7 @@ SAFE_BUILTINS: dict[str, Any] = {
     "ArithmeticError": ArithmeticError, "RuntimeError": RuntimeError,
     "StopIteration": StopIteration, "True": True, "False": False, "None": None,
     "math": math,
+    "__build_class__": __build_class__,  # 允许 class 语句（兼容层/用户类定义；危险调用仍被AST拦截）
 }
 
 
