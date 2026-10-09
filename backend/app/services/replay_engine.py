@@ -227,13 +227,15 @@ def _stock_name(db: Session, ts_code: str) -> str:
     return name or ts_code
 
 
-def _trades_of(db: Session, account_id: int) -> list[SimTrade]:
-    return db.scalars(select(SimTrade).where(SimTrade.account_id == account_id)
-                      .order_by(SimTrade.trade_date, SimTrade.id)).all()
+def _trades_of(db: Session, account_id: int, ts_code: str | None = None) -> list[SimTrade]:
+    stmt = select(SimTrade).where(SimTrade.account_id == account_id)
+    if ts_code:
+        stmt = stmt.where(SimTrade.ts_code == ts_code)  # 会话维度只统计本股票
+    return db.scalars(stmt.order_by(SimTrade.trade_date, SimTrade.id)).all()
 
 
 def summary(db: Session, session: ReplaySession, account: SimAccount) -> dict:
-    trades = _trades_of(db, account.id)
+    trades = _trades_of(db, account.id, session.ts_code)
 
     # 胜率：每笔卖出 vs 其前所有买入的加权成本（简化配对）
     avg_cost: Decimal | None = None

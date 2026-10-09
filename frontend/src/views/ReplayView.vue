@@ -1,9 +1,15 @@
 <template>
   <div class="replay">
-    <!-- 顶部：账户卡片条（点击切换） + 操作 -->
+    <!-- 顶部：账户切换 + 持仓条 + 会话卡片 -->
     <el-card shadow="never">
       <div class="topbar">
-        <el-button type="primary" @click="createDlg = true">新建回放</el-button>
+        <span class="lbl">切换账户</span>
+        <el-select v-model="accountFilter" style="width: 240px" @change="onAccountChange">
+          <el-option label="全部账户" :value="0" />
+          <el-option v-for="a in accountOptions" :key="a.id"
+                     :label="`#${a.id} ${a.name}（${a.count}个回放）`" :value="a.id" />
+        </el-select>
+        <el-button type="primary" @click="openCreate">新建回放</el-button>
         <el-button :disabled="!sessionId" @click="reloadCurrent">查看交易</el-button>
         <el-button @click="refreshList">刷新</el-button>
         <span v-if="detail" class="session-info">
@@ -11,9 +17,23 @@
           · <el-tag size="small" type="info">账户 #{{ detail.session.account_id }}</el-tag>
         </span>
       </div>
+
+      <!-- 选中账户的持仓条 -->
+      <div v-if="accountFilter && posBar" class="pos-bar">
+        <span class="lbl">账户 #{{ accountFilter }} 持仓（现金 {{ fmtMoney(posBar.cash) }}）：</span>
+        <template v-if="posBar.positions.length">
+          <span v-for="p in posBar.positions" :key="p.ts_code" class="pos-chip">
+            {{ p.ts_code }} {{ p.qty }}股@{{ p.avg_cost.toFixed(2) }}
+            现价{{ p.last_price.toFixed(2) }}
+            <b :class="p.pnl_pct >= 0 ? 'up' : 'down'">{{ p.pnl_pct >= 0 ? '+' : '' }}{{ p.pnl_pct }}%</b>
+          </span>
+        </template>
+        <span v-else class="lbl2">空仓</span>
+      </div>
+
       <div class="session-cards">
-        <el-empty v-if="!sessions.length" description="暂无回放账户，点「新建回放」开始" :image-size="60" />
-        <div v-for="s in sessions" :key="s.id"
+        <el-empty v-if="!filteredSessions.length" description="该账户暂无回放会话" :image-size="60" />
+        <div v-for="s in filteredSessions" :key="s.id"
              class="session-card" :class="{ active: s.id === sessionId }"
              @click="switchSession(s.id)">
           <div class="sc-head">
@@ -189,8 +209,21 @@
         <el-form-item label="起始日期">
           <el-date-picker v-model="createForm.start_date" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
         </el-form-item>
-        <el-form-item label="初始资金">
+        <el-form-item label="账户">
+          <el-radio-group v-model="createForm.accountMode">
+            <el-radio-button value="new">新建专属账户</el-radio-button>
+            <el-radio-button value="link">关联已有账户</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="createForm.accountMode === 'new'" label="初始资金">
           <el-input-number v-model="createForm.initial_cash" :min="10000" :step="100000" style="width: 100%" />
+        </el-form-item>
+        <el-form-item v-else label="选择账户">
+          <el-select v-model="createForm.account_id" style="width: 100%" placeholder="选择要关联的账户">
+            <el-option v-for="a in allAccounts" :key="a.id"
+                       :label="`#${a.id} ${a.name}（${a.mode}，总资产 ${Math.round(a.total_value)}）`" :value="a.id" />
+          </el-select>
+          <div class="form-hint">关联账户的现金/持仓与本回放共用，交易互相可见</div>
         </el-form-item>
         <el-form-item label="会话名称">
           <el-input v-model="createForm.name" placeholder="可选" />
@@ -210,9 +243,11 @@ import { ElMessage } from 'element-plus'
 import { init, dispose, type Chart } from 'klinecharts'
 import RealtimeQuoteBar from '../components/RealtimeQuoteBar.vue'
 import {
-  bindReplayStrategy, createReplay, getReplay, getReplaySummary, listReplays,
+  bindReplayStrategy, createReplay, getAccountPositions, getReplay, getReplaySummary,
+  listAccounts, listReplays,
   listStrategies, replayGoto, replayNext, replayOrder, searchStocks, unbindReplayStrategy,
-  type Bar, type ReplayDetail, type ReplayListItem, type ReplaySummary, type StockInfo, type StrategyListItem,
+  type Account, type AccountPositions, type Bar, type ReplayDetail, type ReplayListItem,
+  type ReplaySummary, type StockInfo, type StrategyListItem,
 } from '../api'
 
 const sessions = ref<ReplayListItem[]>([])
@@ -238,7 +273,63 @@ const createDlg = ref(false)
 const creating = ref(false)
 const searching = ref(false)
 const options = ref<StockInfo[]>([])
-const createForm = ref({ ts_code: '', start_date: '', initial_cash: 1000000, name: '' })
+const createForm = ref({ ts_code: '', start_date: '', initial_cash: 1000000, name: '',
+                         accountMode: 'new' as 'new' | 'link', account_id: null as number | null })
+const allAccounts = ref<Account[]>([])
+
+// 账户筛选与持仓条
+const accountFilter = ref(0)  // 0=全部
+const posBar = ref<AccountPositions | null>(null)
+const switchAccounts = ref<Account[]>([])
+
+const accountOptions = computed(() => {
+  const counts = new Map<number, number>()
+  for (const s of sessions.value) {
+    counts.set(s.account_id!, (counts.get(s.account_id!) ?? 0) + 1)
+  }
+  const names = new Map(switchAccounts.value.map(a => [a.id, a]))
+  // 全部账户（含未建回放的），会话列表里出现但账户接口缺失的也补上
+  const ids = new Set<number>([...names.keys(), ...counts.keys()])
+  return [...ids].sort((a, b) => b - a).map(id => ({
+    id,
+    name: names.get(id)?.name ?? `#${id}`,
+    count: counts.get(id) ?? 0,
+  }))
+})
+
+const filteredSessions = computed(() =>
+  accountFilter.value === 0 ? sessions.value
+    : sessions.value.filter(s => s.account_id === accountFilter.value))
+
+const loadPosBar = async () => {
+  if (!accountFilter.value) { posBar.value = null; return }
+  try {
+    posBar.value = await getAccountPositions(accountFilter.value)
+  } catch {
+    posBar.value = null
+  }
+}
+
+const onAccountChange = async () => {
+  await loadPosBar()
+  // 联动切换会话：跳到该账户最近的回放会话（K线/交易明细随之刷新）；无会话则清空
+  if (accountFilter.value === 0) return
+  const latest = filteredSessions.value[0]
+  if (latest) {
+    if (latest.id !== sessionId.value) await switchSession(latest.id)
+  } else {
+    sessionId.value = null
+    detail.value = null
+    summary.value = null
+  }
+}
+
+const openCreate = async () => {
+  createForm.value = { ts_code: '', start_date: '', initial_cash: 1000000, name: '',
+                       accountMode: 'new', account_id: null }
+  try { allAccounts.value = await listAccounts() } catch { allAccounts.value = [] }
+  createDlg.value = true
+}
 
 // K线
 const chartRef = ref<HTMLDivElement>()
@@ -260,6 +351,18 @@ const cursorIndex = computed(() => {
 
 // 十字光标信息条：悬停到含交易的蜡烛时显示该日交易详情
 const hoverTradeInfo = ref('')
+
+/** 交易日落在假期/停牌（无对应K线）时，吸附到 ≤该日的最近一根K线 */
+const snapToDate = (tradeDate: string, dates: string[]): string | null => {
+  if (!dates.length) return null
+  let best: string | null = null
+  for (const d of dates) {
+    if (d <= tradeDate) best = d
+    else break
+  }
+  return best ?? dates[0]  // 早于首根K线的挂首根
+}
+
 const onCrosshair = (data?: { dataIndex?: number }) => {
   const d = detail.value
   if (!d || data?.dataIndex == null) { hoverTradeInfo.value = ''; return }
@@ -267,19 +370,32 @@ const onCrosshair = (data?: { dataIndex?: number }) => {
   const visible = idx >= 0 ? d.bars.slice(0, idx + 1) : []
   const bar = visible[data.dataIndex]
   if (!bar) { hoverTradeInfo.value = ''; return }
-  const dayTrades = d.trades.filter(t => t.trade_date === bar.date)
+  const dates = visible.map(b => b.date)
+  // 交易按吸附后日期匹配（假期交易吸附到前一根K线）
+  const dayTrades = d.trades.filter(t => snapToDate(t.trade_date, dates) === bar.date)
   hoverTradeInfo.value = dayTrades.length
-    ? `${bar.date} ｜ ` + dayTrades.map(t =>
-        `${t.side === 'buy' ? '🔴买入' : '🟢卖出'} ${t.qty}股 @${t.price}（金额${t.amount} 费用${t.fee} 来源${t.source === 'strategy' ? '策略' : '手动'}${t.note ? ' ' + t.note : ''}）`,
+    ? dayTrades.map(t =>
+        `${t.trade_date}${t.trade_date !== bar.date ? `（无K线，标记于${bar.date}）` : ''}` +
+        ` ｜ ${t.side === 'buy' ? '🔴买入' : '🟢卖出'} ${t.qty}股 @${t.price}` +
+        `（金额${t.amount} 费用${t.fee} 来源${t.source === 'strategy' ? '策略' : t.source === 'agent' ? 'Agent' : '手动'}${t.note ? ' ' + t.note : ''}）`,
       ).join('；')
     : ''
 }
 
+let chartEl: HTMLDivElement | null = null  // chart 实例绑定的容器（检测DOM重建）
+
 const ensureChart = () => {
+  // 容器被 v-if 销毁重建后，旧 chart 实例挂在孤儿DOM上 → 必须销毁重建
+  if (chart && chartEl && chartRef.value && chartEl !== chartRef.value) {
+    try { dispose(chartEl) } catch { /* 忽略 */ }
+    chart = null
+    chartEl = null
+  }
   if (chart || !chartRef.value) return chart
   const c = init(chartRef.value)
   if (c) {
     chart = c
+    chartEl = chartRef.value
     c.createIndicator('MA', false, { id: 'candle_pane' })
     c.createIndicator('VOL')
     c.subscribeAction('onCrosshairChange' as never, onCrosshair)
@@ -306,16 +422,20 @@ const renderChart = () => {
   if (visible.length > 0) {
     try { c.scrollToDataIndex(visible.length - 1) } catch { /* 忽略滚动异常 */ }
   }
-  // 交易点 B/S 标记（悬停/点击显示交易详情）
+  // 交易点 B/S 标记（悬停/点击显示交易详情；假期/无K线日吸附到前一根）
+  const visibleDates = visible.map(b => b.date)
   for (const t of d.trades) {
+    const markerDate = snapToDate(t.trade_date, visibleDates)
+    if (!markerDate) continue
     const detailMsg =
-      `${t.trade_date} ${t.side === 'buy' ? '买入' : '卖出'} ${t.qty} 股 @${t.price}` +
+      `${t.trade_date}${t.trade_date !== markerDate ? `（当日无K线，标记于${markerDate}）` : ''}` +
+      ` ${t.side === 'buy' ? '买入' : '卖出'} ${t.qty} 股 @${t.price}` +
       `｜金额 ${t.amount?.toLocaleString?.() ?? t.amount} 费用 ${t.fee}` +
-      `｜来源 ${t.source === 'strategy' ? `策略#${t.strategy_id ?? ''}` : '手动'}` +
+      `｜来源 ${t.source === 'strategy' ? `策略#${t.strategy_id ?? ''}` : t.source === 'agent' ? 'Agent' : '手动'}` +
       (t.note ? `｜${t.note}` : '')
     c.createOverlay({
       name: 'simpleAnnotation',
-      points: [{ timestamp: new Date(t.trade_date + 'T00:00:00').getTime(), value: Number(t.price) }],
+      points: [{ timestamp: new Date(markerDate + 'T00:00:00').getTime(), value: Number(t.price) }],
       extendData: t.side === 'buy' ? 'B' : 'S',
       onMouseEnter: () => {
         ElMessage({ message: detailMsg, type: t.side === 'buy' ? 'warning' : 'success', duration: 2500, grouping: true })
@@ -365,6 +485,9 @@ const reloadCurrent = () => {
 const refreshList = async (selectFirst = false) => {
   try {
     sessions.value = await listReplays()
+    // 同步刷新账户选项与持仓条（其他页面可能新建/删除了账户）
+    try { switchAccounts.value = await listAccounts() } catch { /* ignore */ }
+    if (accountFilter.value) await loadPosBar()
     if (selectFirst && sessions.value.length > 0) {
       sessionId.value = sessions.value[0].id
       await loadSession(sessionId.value)
@@ -444,18 +567,22 @@ const doSearch = async (q: string) => {
 const submitCreate = async () => {
   const f = createForm.value
   if (!f.ts_code || !f.start_date) { ElMessage.warning('请选择股票和起始日期'); return }
+  if (f.accountMode === 'link' && !f.account_id) { ElMessage.warning('请选择要关联的账户'); return }
   creating.value = true
   try {
     const s = await createReplay({
       ts_code: f.ts_code,
       start_date: f.start_date,
-      initial_cash: f.initial_cash,
+      initial_cash: f.accountMode === 'new' ? f.initial_cash : undefined,
       name: f.name || undefined,
+      account_id: f.accountMode === 'link' ? (f.account_id ?? undefined) : undefined,
     })
     createDlg.value = false
     ElMessage.success('回放会话已创建')
     await refreshList()
     sessionId.value = s.id
+    // 新会话属于某账户时，筛选器自动切到该账户
+    if (s.account_id) { accountFilter.value = s.account_id; await loadPosBar() }
     await loadSession(s.id)
   } catch (e) {
     ElMessage.error(`创建失败: ${(e as Error).message}`)
@@ -493,7 +620,13 @@ const unbindStrategy = async () => {
 onMounted(async () => {
   // 图表懒初始化在 renderChart/ensureChart 中完成（容器随 detail 渲染）
   try { strategies.value = await listStrategies() } catch { /* ignore */ }
+  try { switchAccounts.value = await listAccounts() } catch { /* ignore */ }
   await refreshList(true)
+  // 默认选中最近活跃账户并显示其持仓
+  if (sessions.value.length) {
+    accountFilter.value = sessions.value[0].account_id ?? 0
+    await loadPosBar()
+  }
 })
 
 onBeforeUnmount(() => {
@@ -519,6 +652,11 @@ onBeforeUnmount(() => {
 .sc-body { display: flex; justify-content: space-between; align-items: baseline; }
 .sc-value { font-size: 18px; font-weight: 700; }
 .sc-sub { color: #c0c4cc; font-size: 12px; margin-top: 4px; }
+.pos-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; margin-bottom: 10px; background: #f5f7fa; border-radius: 6px; font-size: 13px; }
+.pos-chip { background: #fff; border: 1px solid #e4e7ed; border-radius: 4px; padding: 2px 8px; }
+.form-hint { color: #909399; font-size: 12px; margin-top: 2px; }
+.lbl2 { color: #c0c4cc; }
 .stat-row { display: flex; gap: 32px; }
 .stat { display: flex; flex-direction: column; }
 .stat .lbl { color: #909399; font-size: 12px; }

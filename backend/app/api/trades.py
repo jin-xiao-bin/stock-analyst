@@ -35,6 +35,28 @@ def create_account(body: dict, db: Session = Depends(get_db)):
             "initial_cash": float(a.initial_cash), "cash": float(a.cash)}
 
 
+@router.get("/accounts/{account_id}/positions")
+def account_positions(account_id: int, db: Session = Depends(get_db)):
+    """单账户持仓明细（按最新收盘估值）"""
+    a = db.get(SimAccount, account_id)
+    if a is None:
+        raise HTTPException(404, f"账户 {account_id} 不存在")
+    out = []
+    for p in db.scalars(select(SimPosition).where(
+            SimPosition.account_id == account_id)).all():
+        last = db.scalar(
+            select(DailyPrice.close).where(DailyPrice.ts_code == p.ts_code)
+            .order_by(DailyPrice.trade_date.desc()).limit(1))
+        px = float(last or 0)
+        avg = float(p.avg_cost)
+        out.append({"ts_code": p.ts_code, "qty": p.qty, "avg_cost": avg,
+                    "last_price": px, "market_value": round(px * p.qty, 2),
+                    "pnl": round((px - avg) * p.qty, 2),
+                    "pnl_pct": round((px / avg - 1) * 100, 2) if avg else 0})
+    return {"account_id": account_id, "cash": float(a.cash),
+            "positions": out}
+
+
 @router.delete("/accounts/{account_id}")
 def delete_account(account_id: int, db: Session = Depends(get_db)):
     """删除账户：级联删除其交易记录、持仓、回放会话、策略绑定"""

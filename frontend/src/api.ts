@@ -129,8 +129,15 @@ export interface ReplaySummary {
 }
 
 export const listReplays = () => api.get<ReplayListItem[]>('/replay').then(r => r.data)
-export const createReplay = (payload: { ts_code: string; start_date: string; initial_cash?: number; name?: string }) =>
+export const createReplay = (payload: { ts_code: string; start_date: string; initial_cash?: number; name?: string; account_id?: number }) =>
   api.post<ReplaySession>('/replay', payload).then(r => r.data)
+export interface AccountPositions {
+  account_id: number
+  cash: number
+  positions: { ts_code: string; qty: number; avg_cost: number; last_price: number; market_value: number; pnl: number; pnl_pct: number }[]
+}
+export const getAccountPositions = (id: number) =>
+  api.get<AccountPositions>(`/accounts/${id}/positions`).then(r => r.data)
 export const getReplay = (id: number) => api.get<ReplayDetail>(`/replay/${id}`).then(r => r.data)
 export const replayNext = (id: number, days = 1) =>
   api.post<ReplayDetail>(`/replay/${id}/next`, { days }).then(r => r.data)

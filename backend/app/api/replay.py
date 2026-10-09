@@ -22,6 +22,7 @@ class CreateReq(BaseModel):
     start_date: dt.date
     initial_cash: float = 1_000_000
     name: str | None = None
+    account_id: int | None = None  # 关联已有账户；空则新建专属账户
 
 
 class OrderReq(BaseModel):
@@ -52,7 +53,8 @@ def _detail(db: Session, s: ReplaySession) -> dict:
             .order_by(DailyPrice.trade_date)).all()
     ]
     trades = [engine.trade_dict(t) for t in db.scalars(
-        select(SimTrade).where(SimTrade.account_id == s.account_id)
+        select(SimTrade).where(SimTrade.account_id == s.account_id,
+                               SimTrade.ts_code == s.ts_code)  # 只看本会话股票的交易
         .order_by(SimTrade.trade_date, SimTrade.id)).all()
         if t.trade_date <= s.cursor_date]
     return {
@@ -84,10 +86,15 @@ def create_session(req: CreateReq, db: Session = Depends(get_db)):
     if start is None:
         raise HTTPException(400, f"{req.start_date} 起无行情数据")
 
-    account = SimAccount(name=req.name or f"回放 {req.ts_code}", mode="replay",
-                         initial_cash=req.initial_cash, cash=req.initial_cash)
-    db.add(account)
-    db.flush()
+    if req.account_id:
+        account = db.get(SimAccount, req.account_id)
+        if account is None:
+            raise HTTPException(404, f"账户 {req.account_id} 不存在")
+    else:
+        account = SimAccount(name=req.name or f"回放 {req.ts_code}", mode="replay",
+                             initial_cash=req.initial_cash, cash=req.initial_cash)
+        db.add(account)
+        db.flush()
     s = ReplaySession(account_id=account.id, ts_code=req.ts_code,
                       start_date=start, cursor_date=start, auto_play=False, speed_days=1)
     db.add(s)

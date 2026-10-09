@@ -66,7 +66,7 @@ def reply(chat_id: str, text: str):
 def _cmd_status() -> str:
     from ..db import SessionLocal
     from ..models import AgentConfig
-    from . import risk as risk_engine
+    from .agent import risk as risk_engine
     db = SessionLocal()
     try:
         c = db.query(AgentConfig).first()
@@ -94,7 +94,7 @@ from sqlalchemy import select  # noqa: E402
 def _cmd_decide(code: str, deep: bool) -> str:
     from ..db import SessionLocal
     from ..models import AgentConfig, SimAccount
-    from .trader import run_intraday, run_daily
+    from .agent.trader import run_intraday, run_daily
     db = SessionLocal()
     try:
         c = db.query(AgentConfig).first()
@@ -115,9 +115,9 @@ def _cmd_decide(code: str, deep: bool) -> str:
 def _cmd_trade(action: str, code: str, qty: int | None, pct: float | None) -> str:
     from ..db import SessionLocal
     from ..models import AgentConfig, SimAccount
-    from ..services.realtime import get_realtime
-    from .executor import execute_agent_order
-    from . import risk as risk_engine
+    from .realtime import get_realtime
+    from .agent.executor import execute_agent_order
+    from .agent import risk as risk_engine
     db = SessionLocal()
     try:
         c = db.query(AgentConfig).first()
@@ -202,21 +202,26 @@ def handle_text(text: str, chat_id: str):
                              daemon=True).start()
             return None
         if t.startswith(("买入", "卖出")):
-            parts = t.split()
-            if len(parts) < 2:
-                return "用法：买入/卖出 000001 [数量股|百分比%|全部]"
             action = "buy" if t.startswith("买入") else "sell"
-            code, spec = parts[0].replace("买入", "").replace("卖出", ""), parts[1]
+            # 去掉指令词后取参数：支持 "买入 601689 1000股" / "买入601689 1000股" / "买入 601689 20%"
+            toks = t[2:].strip().split()
+            if not toks:
+                return "用法：买入/卖出 601689 [1000股|20%|全部]（缺省时买入按风控仓位、卖出全部）"
+            code = toks[0]
+            spec = toks[1] if len(toks) > 1 else None
             qty = pct = None
-            if spec.replace("股", "").isdigit():
+            if spec is None:
+                pass  # 缺省：买入走风控默认仓位，卖出=全部
+            elif spec.replace("股", "").isdigit():
                 qty = int(spec.replace("股", ""))
             elif spec.endswith("%"):
                 pct = float(spec[:-1]) / 100
             elif action == "sell" and spec in ("全部", "all"):
                 qty = None
             else:
-                return "数量格式不对，示例：买入 000001 1000股 / 卖出 000001 20%"
+                return "数量格式不对，示例：买入 601689 1000股 / 卖出 601689 20%"
             from ..utils import resolve_ts_code
+            from ..db import SessionLocal
             db = SessionLocal()
             try:
                 code = resolve_ts_code(db, code) or code
@@ -237,9 +242,9 @@ def _cmd_chat(text: str, chat_id: str):
         try:
             from ..db import SessionLocal
             from ..models import AgentConfig, SimPosition
-            from ..services.realtime import get_realtime
-            from ..services import news_source
-            from ..services.deepseek_client import client as ds_client
+            from .realtime import get_realtime
+            from . import news_source
+            from .deepseek_client import client as ds_client
             from ..config import settings
 
             codes = _re.findall(r"\d{6}", text)
@@ -293,8 +298,8 @@ def _cmd_chat(text: str, chat_id: str):
 def _cmd_force_close() -> str:
     from ..db import SessionLocal
     from ..models import AgentConfig, SimAccount, SimPosition
-    from ..services.realtime import get_realtime
-    from .executor import execute_agent_order
+    from .realtime import get_realtime
+    from .agent.executor import execute_agent_order
     db = SessionLocal()
     try:
         c = db.query(AgentConfig).first()
@@ -354,6 +359,7 @@ def start_ws_client():
                 content = json.loads(msg.content)
                 text = content.get("text", "")
                 chat_id = msg.chat_id
+                log.info("飞书消息到达: chat=%s text=%r", chat_id, text[:80])
                 reply_text = handle_text(text, chat_id)
                 if reply_text:
                     reply(chat_id, reply_text)
