@@ -125,6 +125,13 @@ def aggregate(db: Session, config, account: SimAccount, ts_code: str,
     if ref_ids:
         data["strategy_signals"] = [strategy_signal(db, sid, ts_code) for sid in ref_ids]
 
+    # P0-3 未来5日事件日历（财报/解禁/除权）
+    try:
+        from ..event_sync import upcoming_events
+        data["upcoming_events"] = upcoming_events(db, ts_code, days=5)
+    except Exception:  # noqa: BLE001
+        data["upcoming_events"] = []
+
     # 学习注入区（F10：每周日自动复盘生成）
     if config.prompt_notes:
         data["learning_notes"] = config.prompt_notes

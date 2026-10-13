@@ -1,0 +1,37 @@
+# 密钥与本地配置
+backend/.env
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+vendor/
+
+# 临时文件
+backend/tmp/
+tmp/
+*.log
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+
+# 本地数据
+backend/logs/
+desktop/skin_candidates/
+desktop/tmp/
+/docs/agent-trading-技术设计.md
+/docs/agent-trading-需求说明.md
+/docs/desktop-pet-技术方案.md
+/docs/api-contracts.md
+/docs/project-interview-项目说明.md
+/docs/roadmap-优化路线图.md
+/docs/优化技术方案.md
+/docs/多用户鉴权技术方案.md
+/docs/项目介绍文章.md

@@ -67,6 +67,58 @@ class DailyBasic(Base):
     circ_mv: Mapped[float | None] = mapped_column(DECIMAL(18, 2))    # 流通市值(万元)
 
 
+class IndexDaily(Base):
+    """指数日线（benchmark 对比用）"""
+    __tablename__ = "index_daily"
+    ts_code: Mapped[str] = mapped_column(String(16), primary_key=True)
+    trade_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    open: Mapped[float] = mapped_column(DECIMAL(12, 4))
+    high: Mapped[float] = mapped_column(DECIMAL(12, 4))
+    low: Mapped[float] = mapped_column(DECIMAL(12, 4))
+    close: Mapped[float] = mapped_column(DECIMAL(12, 4))
+    pct_chg: Mapped[float | None] = mapped_column(DECIMAL(10, 4))
+
+
+class EventCalendar(Base):
+    """事件日历：财报/解禁/除权除息（P0-3，agent 自动规避）"""
+    __tablename__ = "event_calendar"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ts_code: Mapped[str] = mapped_column(String(16), index=True)
+    event_type: Mapped[str] = mapped_column(String(24))  # earnings_forecast/earnings/unlock/ex_dividend
+    event_date: Mapped[dt.date] = mapped_column(Date, index=True)
+    detail: Mapped[str | None] = mapped_column(String(255))
+    source: Mapped[str] = mapped_column(String(16), default="tushare")
+    __table_args__ = (UniqueConstraint("ts_code", "event_type", "event_date",
+                                       "detail", name="uk_event"),)
+
+
+class FeishuUser(Base):
+    """飞书用户（鉴权主体）"""
+    __tablename__ = "feishu_user"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    open_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    role: Mapped[str] = mapped_column(String(16))     # admin / trader / viewer
+    account_id: Mapped[int | None] = mapped_column(BigInteger)  # trader绑定的sim_account
+    status: Mapped[str] = mapped_column(String(8), default="active")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=dt.datetime.now, onupdate=dt.datetime.now)
+
+
+class OperationLog(Base):
+    """操作审计：所有飞书指令留痕"""
+    __tablename__ = "operation_log"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    user_name: Mapped[str | None] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(32))
+    detail: Mapped[dict | None] = mapped_column(JSON)
+    account_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=dt.datetime.now, index=True)
+
+
 class FinancialSnapshot(Base):
     __tablename__ = "financial_snapshot"
     ts_code: Mapped[str] = mapped_column(String(16), primary_key=True)
@@ -185,6 +237,23 @@ class StrategyDiscussion(Base):
     role: Mapped[str] = mapped_column(String(16))  # user / assistant
     content: Mapped[str] = mapped_column(Text)
     proposed_code: Mapped[str | None] = mapped_column(Text)  # assistant 消息携带的新代码
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
+
+
+class ParamScan(Base):
+    """参数寻优任务：网格扫描 + 过拟合诊断"""
+    __tablename__ = "param_scan"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    ts_code: Mapped[str] = mapped_column(String(16))
+    start_date: Mapped[dt.date | None] = mapped_column(Date)
+    end_date: Mapped[dt.date | None] = mapped_column(Date)
+    grid: Mapped[dict | None] = mapped_column(JSON)        # [{name,start,end,step}]
+    status: Mapped[str] = mapped_column(String(16))         # running/done/failed
+    results: Mapped[dict | None] = mapped_column(JSON)      # [{params:{}, metrics:{}}]
+    best: Mapped[dict | None] = mapped_column(JSON)         # {params, metrics, overfit_risk, plain_center}
+    heat: Mapped[dict | None] = mapped_column(JSON)         # {x_name,y_name,x_vals,y_vals,matrix}
+    error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
 
 

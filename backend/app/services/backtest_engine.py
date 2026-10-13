@@ -253,6 +253,25 @@ def load_bars(db: Session, ts_code: str, start=None, end=None) -> list[dict]:
 
 
 # ---------------------------------------------------------------- 主入口
+def equity_replay(bars: list[dict], trades: list[dict],
+                  initial_cash: float = 1_000_000.0) -> list[dict]:
+    """逐日重演权益曲线（独立函数，供回测/寻优共用）"""
+    curve, ti, cash, q = [], 0, initial_cash, 0
+    for bar in bars:
+        d = bar["date"]
+        while ti < len(trades) and trades[ti]["trade_date"] == d:
+            t = trades[ti]
+            if t["side"] == "buy":
+                cash -= t["amount"] + t["fee"]
+                q += t["qty"]
+            else:
+                cash += t["amount"] - t["fee"]
+                q -= t["qty"]
+            ti += 1
+        curve.append({"date": d, "equity": round(cash + q * bar["close"], 2)})
+    return curve
+
+
 def run_backtest(db: Session, code: str, params: dict | None, ts_code: str,
                  start=None, end=None, initial_cash: float = 1_000_000.0,
                  strategy_id: int | None = None) -> dict:
@@ -321,6 +340,24 @@ def run_backtest(db: Session, code: str, params: dict | None, ts_code: str,
     curve = equity_curve()
     metrics = compute_metrics([p["equity"] for p in curve], trader.trades, initial_cash)
 
+    # ---- P0-1 benchmark：沪深300 同区间归一化曲线 + 超额收益 ----
+    benchmark = _benchmark_curve(db, bars, initial_cash)
+    if benchmark:
+        b_first = benchmark[0]["equity"]
+        b_last = benchmark[-1]["equity"]
+        b_ret = (b_last / b_first - 1) if b_first else 0.0
+        metrics["benchmark_return"] = round(b_ret, 6)
+        metrics["excess_return"] = round(metrics["total_return"] - b_ret, 6)
+        # 跑赢基准天数占比
+        strat_eq = {p["date"]: p["equity"] for p in curve}
+        b_eq = {p["date"]: p["equity"] for p in benchmark}
+        common = sorted(set(strat_eq) & set(b_eq))
+        if len(common) >= 2:
+            win_days = sum(1 for i in range(1, len(common))
+                           if strat_eq[common[i]] / strat_eq[common[i - 1]]
+                           >= b_eq[common[i]] / b_eq[common[i - 1]])
+            metrics["win_days_pct"] = round(win_days / (len(common) - 1), 4)
+
     run.status = "success"
     run.metrics = metrics
     run.equity_curve = curve
@@ -330,7 +367,28 @@ def run_backtest(db: Session, code: str, params: dict | None, ts_code: str,
             "ts_code": ts_code, "start_date": bars[0]["date"] if bars else None,
             "end_date": bars[-1]["date"] if bars else None,
             "initial_cash": initial_cash, "metrics": metrics,
-            "equity_curve": curve, "trades": trader.trades, "error": None}
+            "equity_curve": curve, "trades": trader.trades, "error": None,
+            "benchmark_curve": benchmark}
+
+
+def _benchmark_curve(db: Session, bars: list[dict], initial_cash: float) -> list[dict]:
+    """指数同区间归一化为初始资金的 equity 曲线；无数据返回 []（静默降级）"""
+    try:
+        from ..models import IndexDaily
+        first, last = bars[0]["date"], bars[-1]["date"]
+        rows = db.scalars(select(IndexDaily).where(
+            IndexDaily.ts_code == "000300.SH",
+            IndexDaily.trade_date >= first, IndexDaily.trade_date <= last)
+            .order_by(IndexDaily.trade_date)).all()
+        if not rows:
+            return []
+        base = float(rows[0].close)
+        if not base:
+            return []
+        return [{"date": r.trade_date.isoformat(),
+                 "equity": round(float(r.close) / base * initial_cash, 2)} for r in rows]
+    except Exception:  # noqa: BLE001 基准缺数据不影响回测
+        return []
 
 
 def validate_strategy_code(db: Session, code: str, params: dict | None = None,

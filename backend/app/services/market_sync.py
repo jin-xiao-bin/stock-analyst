@@ -7,8 +7,76 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
-from ..models import AdjFactor, DailyBasic, DailyPrice, FinancialSnapshot, StockBasic
+from ..models import (AdjFactor, DailyBasic, DailyPrice, FinancialSnapshot,
+                      IndexDaily, StockBasic)
 from .tushare_client import client
+
+BENCHMARK_INDEX = "000300.SH"  # 沪深300
+
+
+def sync_index(db: Session, ts_code: str = BENCHMARK_INDEX) -> int:
+    """同步指数日线（benchmark 用）。Tushare 失败时东财兜底。"""
+    last = db.scalar(select(func.max(IndexDaily.trade_date))
+                     .where(IndexDaily.ts_code == ts_code))
+    start = None
+    if last:
+        start = (last + dt.timedelta(days=1)).strftime("%Y%m%d")
+        if start > dt.date.today().strftime("%Y%m%d"):
+            return 0
+    kwargs = {"ts_code": ts_code,
+              "fields": "ts_code,trade_date,open,high,low,close,pct_chg"}
+    if start:
+        kwargs["start_date"] = start
+    try:
+        df = client.query("index_daily", retries=1, **kwargs)
+    except Exception as e:  # noqa: BLE001 Tushare 失败 → 东财兜底
+        log.warning("index_daily 走Tushare失败(%s)，尝试东财兜底", e)
+        return _sync_index_em(db, ts_code, last)
+    if df.empty:
+        return _sync_index_em(db, ts_code, last)
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    for c in ("open", "high", "low", "close", "pct_chg"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.astype(object).where(pd.notna(df), None)
+    return _upsert_df(db, IndexDaily, df, ["ts_code", "trade_date"])
+
+
+def _sync_index_em(db: Session, ts_code: str, last) -> int:
+    """东财指数K线兜底（secid: 1.000300）"""
+    import httpx
+    sec_map = {"000300.SH": "1.000300", "000001.SH": "1.000001",
+               "399001.SZ": "0.399001", "399006.SZ": "0.399006"}
+    secid = sec_map.get(ts_code)
+    if not secid:
+        return 0
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+    klt = 101  # 日线
+    # fqt=0 不复权; 取最近400根
+    r = httpx.get("https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                  params={"secid": secid, "fields1": "f1,f2,f3",
+                          "fields2": "f51,f52,f53,f54,f55,f56,f57",
+                          "klt": klt, "fqt": 0, "end": "20500101", "lmt": 400},
+                  headers=headers, timeout=15)
+    r.raise_for_status()
+    klines = ((r.json().get("data") or {}).get("klines")) or []
+    rows = []
+    prev_close = None
+    for k in klines:
+        parts = k.split(",")
+        d = dt.datetime.strptime(parts[0], "%Y-%m-%d").date()
+        if last and d <= last:
+            prev_close = float(parts[2])
+            continue
+        o, c, h, l = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+        pct = (c / prev_close - 1) * 100 if prev_close else None
+        prev_close = c
+        rows.append({"ts_code": ts_code, "trade_date": d, "open": o, "high": h,
+                     "low": l, "close": c, "pct_chg": pct})
+    if not rows:
+        return 0
+    df = pd.DataFrame(rows)
+    df = df.astype(object).where(pd.notna(df), None)
+    return _upsert_df(db, IndexDaily, df, ["ts_code", "trade_date"])
 
 log = logging.getLogger(__name__)
 
@@ -137,7 +205,7 @@ def is_local_stale(db: Session, ts_code: str) -> bool:
 
 
 def sync_all_tracked(db: Session) -> dict:
-    """每日定时任务：增量更新所有本地已有行情的股票"""
+    """每日定时任务：增量更新所有本地已有行情的股票 + 指数基准"""
     codes = db.execute(select(DailyPrice.ts_code).distinct()).scalars().all()
     total = 0
     failed = []
@@ -148,5 +216,9 @@ def sync_all_tracked(db: Session) -> dict:
         except Exception as e:  # noqa: BLE001
             log.error("增量同步 %s 失败: %s", code, e)
             failed.append(code)
+    try:
+        sync_index(db)
+    except Exception as e:  # noqa: BLE001
+        log.warning("指数基准同步失败: %s", e)
     log.info("每日增量同步完成: %d 只股票, %d 行, 失败 %d", len(codes), total, len(failed))
     return {"stocks": len(codes), "rows": total, "failed": failed}

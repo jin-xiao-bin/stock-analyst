@@ -1,9 +1,11 @@
 """策略中心 API（契约第4节）+ activate/deactivate（契约第7节）"""
 from __future__ import annotations
 
+import datetime as dt
+import itertools
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -68,6 +70,59 @@ class DiscussBody(BaseModel):
 class JqImportBody(BaseModel):
     code: str
     name: str | None = None
+
+
+class ScanBody(BaseModel):
+    ts_code: str
+    start_date: dt.date | None = None
+    end_date: dt.date | None = None
+    grid: list[dict]  # [{name, start, end, step}]（≤2个参数）
+
+
+@router.post("/{sid}/scan")
+def start_scan(sid: int, body: ScanBody, background: BackgroundTasks,
+               db: Session = Depends(get_db)):
+    """参数寻优：网格扫描（后台线程），返回 scan_id 供轮询"""
+    from ..models import ParamScan
+    from ..utils import resolve_ts_code
+    s = _get_or_404(db, sid)
+    if len(body.grid) > 2 or not body.grid:
+        raise HTTPException(400, "寻优支持 1-2 个参数网格")
+    ts_code = resolve_ts_code(db, body.ts_code) or body.ts_code
+    scan = ParamScan(strategy_id=sid, ts_code=ts_code,
+                     start_date=body.start_date, end_date=body.end_date,
+                     grid=body.grid, status="running")
+    db.add(scan)
+    db.commit()
+    db.refresh(scan)
+    from ..services.param_scan import run_scan
+    background.add_task(run_scan, scan.id)
+    return {"scan_id": scan.id, "status": "running", "total_combos":
+            len(list(itertools.product(
+                *[range(int((g["end"] - g["start"]) / g["step"]) + 1) for g in body.grid])))}
+
+
+@router.get("/scans/{scan_id}")
+def get_scan(scan_id: int, db: Session = Depends(get_db)):
+    from ..models import ParamScan
+    scan = db.get(ParamScan, scan_id)
+    if not scan:
+        raise HTTPException(404, "寻优任务不存在")
+    return {"id": scan.id, "strategy_id": scan.strategy_id, "ts_code": scan.ts_code,
+            "status": scan.status, "grid": scan.grid,
+            "results": scan.results, "best": scan.best, "heat": scan.heat,
+            "error": scan.error, "created_at": scan.created_at.isoformat()}
+
+
+@router.get("/{sid}/scans")
+def list_scans(sid: int, db: Session = Depends(get_db)):
+    from ..models import ParamScan
+    rows = db.scalars(select(ParamScan).where(
+        ParamScan.strategy_id == sid)
+        .order_by(ParamScan.id.desc()).limit(10)).all()
+    return [{"id": r.id, "status": r.status, "grid": r.grid,
+             "best": r.best, "created_at": r.created_at.isoformat(timespec="minutes"),
+             "n_results": len(r.results or [])} for r in rows]
 
 
 @router.post("/import-jq")

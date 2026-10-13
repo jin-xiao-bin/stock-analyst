@@ -178,6 +178,7 @@ def run_intraday(db: Session, config: AgentConfig, account: SimAccount, ts_code:
         f"新闻标题: {snapshot.get('news_headlines')}\n"
         f"已触发观察: {json.dumps(snapshot.get('triggered_watch', []), ensure_ascii=False)}\n"
         f"参考策略信号: {json.dumps(snapshot.get('strategy_signals', []), ensure_ascii=False)}\n"
+        f"未来5日事件: {json.dumps(snapshot.get('upcoming_events', []), ensure_ascii=False)}\n"
         f"近期决策: {json.dumps(snapshot.get('recent_decisions', []), ensure_ascii=False)}\n"
         f"学习提示: {snapshot.get('learning_notes', '无')}"
     )

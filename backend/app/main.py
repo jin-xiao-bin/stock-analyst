@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select
 
 from .api import admin, stocks
 from .db import SessionLocal, init_db
@@ -109,6 +110,26 @@ async def lifespan(app: FastAPI):
         from .services.agent.learning import weekly_learning  # noqa: F401
         scheduler.add_job(lambda: weekly_learning(), "cron",
                           day_of_week="sun", hour=18, minute=0, id="agent_learning")
+        # P0-7 周报（学习笔记后1小时）
+        from .services.weekly_report import weekly_report  # noqa: F401
+        scheduler.add_job(lambda: weekly_report(), "cron",
+                          day_of_week="sun", hour=19, minute=0, id="weekly_report")
+        # P0-3 事件日历同步（行情同步后）
+        def _job_event_sync():
+            try:
+                from .models import AgentConfig, SimPosition
+                from .services.event_sync import sync_events
+                db = SessionLocal()
+                try:
+                    c = db.query(AgentConfig).first()
+                    codes = set((c.stocks or []) if c else [])
+                    codes |= set(db.scalars(select(SimPosition.ts_code).distinct()).all())
+                    sync_events(db, list(codes))
+                finally:
+                    db.close()
+            except Exception as e:  # noqa: BLE001
+                log.warning("事件同步失败: %s", e)
+        scheduler.add_job(_job_event_sync, "cron", hour=17, minute=15, id="event_sync")
     except ImportError:
         log.info("agent trader 未就绪，跳过自主交易调度")
     # 飞书指令通道（长连接，后台线程）
@@ -157,6 +178,7 @@ for _mod, _attr in [
     ("app.api.agent", "router"),
     ("app.api.events", "router"),
     ("app.api.pet", "router"),
+    ("app.api.users", "router"),
 ]:
     try:
         import importlib

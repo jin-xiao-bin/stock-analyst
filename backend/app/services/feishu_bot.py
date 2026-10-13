@@ -20,14 +20,14 @@ from ..config import settings
 
 log = logging.getLogger(__name__)
 
-_tenant_token: dict = {}  # {"token":..., "expire": ts}
+_tenant_token_cache: dict = {}  # {"token":..., "expire": ts}
 
 
 def _tenant_token() -> str | None:
     import time
     now = time.time()
-    if _tenant_token.get("expire", 0) > now + 60:
-        return _tenant_token["token"]
+    if _tenant_token_cache.get("expire", 0) > now + 60:
+        return _tenant_token_cache["token"]
     try:
         r = httpx.post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
                        json={"app_id": settings.feishu_app_id,
@@ -36,9 +36,9 @@ def _tenant_token() -> str | None:
         if d.get("code") != 0:
             log.warning("获取 tenant_access_token 失败: %s", d)
             return None
-        _tenant_token["token"] = d["tenant_access_token"]
-        _tenant_token["expire"] = now + int(d.get("expire", 3600)) - 120
-        return _tenant_token["token"]
+        _tenant_token_cache["token"] = d["tenant_access_token"]
+        _tenant_token_cache["expire"] = now + int(d.get("expire", 3600)) - 120
+        return _tenant_token_cache["token"]
     except Exception as e:  # noqa: BLE001
         log.warning("tenant token 请求异常: %s", e)
         return None
@@ -63,25 +63,34 @@ def reply(chat_id: str, text: str):
 
 # ---------------- 指令执行（开独立会话，线程安全） ----------------
 
-def _cmd_status() -> str:
+def _cmd_status_for(account_id: int | None = None) -> str:
+    """状态查询（可指定个人账户；默认基金账户）"""
     from ..db import SessionLocal
-    from ..models import AgentConfig
+    from ..models import AgentConfig, SimAccount, SimPosition
     from .agent import risk as risk_engine
     db = SessionLocal()
     try:
+        if account_id:
+            acc = db.get(SimAccount, account_id)
+            if not acc:
+                return f"账户#{account_id} 不存在"
+            value = risk_engine.account_value(db, acc)
+            positions = db.scalars(select(SimPosition).where(
+                SimPosition.account_id == account_id)).all()
+            pl = "；".join(f"{p.ts_code} {p.qty}股@{p.avg_cost}" for p in positions) or "空仓"
+            return (f"我的账户 #{account_id} {acc.name}\n"
+                    f"总资产：{value:.0f}（初始 {float(acc.initial_cash):.0f}）\n"
+                    f"现金：{float(acc.cash):.0f}｜持仓：{pl}")
+        # 基金账户（admin 默认）
         c = db.query(AgentConfig).first()
         if not c:
             return "尚未配置自主交易"
-        acc = db.get(__import__("app.models", fromlist=["SimAccount"]).SimAccount, c.account_id)
+        acc = db.get(SimAccount, c.account_id)
         value = risk_engine.account_value(db, acc)
-        pos = db.scalars(
-            __import__("app.models", fromlist=["SimPosition"]).SimPosition.__table__.select()
-        ).all() if False else None  # placeholder
-        from ..models import SimPosition
         positions = db.scalars(select(SimPosition).where(
             SimPosition.account_id == c.account_id)).all()
         pl = "；".join(f"{p.ts_code} {p.qty}股@{p.avg_cost}" for p in positions) or "空仓"
-        return (f"状态：{c.status}｜风格：{c.style}｜巡逻：{c.patrol_freq}分钟\n"
+        return (f"基金账户状态：{c.status}｜风格：{c.style}｜巡逻：{c.patrol_freq}分钟\n"
                 f"总资产：{value:.0f}（初始 {float(acc.initial_cash):.0f}）\n"
                 f"现金：{float(acc.cash):.0f}｜持仓：{pl}\n股票池：{'、'.join(c.stocks or [])}")
     finally:
@@ -112,7 +121,9 @@ def _cmd_decide(code: str, deep: bool) -> str:
         db.close()
 
 
-def _cmd_trade(action: str, code: str, qty: int | None, pct: float | None) -> str:
+def _cmd_trade(action: str, code: str, qty: int | None, pct: float | None,
+               account_id: int | None = None) -> str:
+    """交易指令（可指定账户，默认基金账户）"""
     from ..db import SessionLocal
     from ..models import AgentConfig, SimAccount
     from .realtime import get_realtime
@@ -120,10 +131,13 @@ def _cmd_trade(action: str, code: str, qty: int | None, pct: float | None) -> st
     from .agent import risk as risk_engine
     db = SessionLocal()
     try:
-        c = db.query(AgentConfig).first()
-        if not c:
-            return "尚未配置自主交易"
-        acc = db.get(SimAccount, c.account_id)
+        if account_id:
+            acc = db.get(SimAccount, account_id)
+        else:
+            c = db.query(AgentConfig).first()
+            acc = db.get(SimAccount, c.account_id) if c else None
+        if not acc:
+            return "未找到账户"
         rt = get_realtime(code) or {}
         price = rt.get("price")
         if not price:
@@ -131,10 +145,21 @@ def _cmd_trade(action: str, code: str, qty: int | None, pct: float | None) -> st
         if action == "sell" and qty is None:
             qty = None  # 全部
         if qty is None:
-            rc = risk_engine.check(db, c, acc, code, action, pct, 1.0, price)
-            if not rc["ok"]:
-                return f"风控拒绝：{rc['note']}"
-            qty = rc["qty"]
+            # 个人账户不走风控闸门（手动指令用户自担）；基金账户走
+            if account_id is None:
+                rc = risk_engine.check(db, c, acc, code, action, pct, 1.0, price)
+                if not rc["ok"]:
+                    return f"风控拒绝：{rc['note']}"
+                qty = rc["qty"]
+            else:
+                # 个人账户：买入按金额比例，卖出全部
+                if action == "buy":
+                    budget = float(acc.cash) * (pct or 0.2)
+                    qty = int(budget / float(price) / 100) * 100
+                else:
+                    pos = db.scalar(select(SimPosition).where(
+                        SimPosition.account_id == acc.id, SimPosition.ts_code == code))
+                    qty = pos.qty if pos else 0
         res = execute_agent_order(db, acc, code, action, qty, float(price),
                                   rt.get("pre_close"), note="agent:feishu_cmd")
         if not res["ok"]:
@@ -174,36 +199,125 @@ def _cmd_toggle(code: str, disable: bool) -> str:
         db.close()
 
 
-def handle_text(text: str, chat_id: str):
-    """解析并执行指令；返回回复文本（由调用方回复）或直接在线程内回复"""
+def handle_text(text: str, chat_id: str, open_id: str = ""):
+    """鉴权 → 解析指令 → 按角色路由执行 → 审计；返回回复文本"""
+    from . import feishu_auth as auth
+
     t = text.strip().replace("@_user_1", "").strip()
-    try:
+
+    # ---- 鉴权 ----
+    user = auth.get_user_by_open_id(open_id) if open_id else None
+    # ---- 鉴权前的免鉴权指令 ----
+    if t == "我的ID":
+        return f"您的 open_id：\n{open_id}\n\n请将此 ID 发给管理员，在飞书群里执行：\n添加用户 {open_id} 您的昵称 trader"
+
+    if user is None:
+        # 未注册用户：自动回复其 open_id，方便发给管理员开通
         if t in ("帮助", "help", "Help"):
-            return ("指令集：\n买入 000001 1000股｜买入 000001 20%\n"
-                    "卖出 000001 全部｜卖出 000001 500股\n决策 000001 深度｜状态\n"
-                    "清仓｜停止巡逻 000001｜开始巡逻 000001｜任务")
-        if t in ("状态",):
-            return _cmd_status()
-        if t == "清仓":
-            r = _cmd_force_close()
-            return r
-        if t == "任务":
-            return _cmd_tasks()
-        if t.startswith(("停止巡逻", "开始巡逻")):
+            return ("⛔ 您尚未授权使用本机器人。\n"
+                    f"您的 open_id：{open_id}\n"
+                    "请将此 ID 发给管理员，管理员在群里执行：\n"
+                    f"添加用户 {open_id} 您的名字 trader")
+        auth.log_operation(None, "unauthorized", {"text": t[:100], "open_id": open_id})
+        return (f"⛔ 未授权用户，请联系管理员开通。\n"
+                f"您的 open_id（发给管理员）：{open_id}")
+
+    role = user.role
+    try:
+        # ---- admin 专属：用户管理 ----
+        if t == "用户列表":
+            if not auth.can_manage_users(user):
+                return "⛔ 仅 admin 可管理用户"
+            result = auth.list_users()
+            auth.log_operation(user, "list_users")
+            return result
+
+        if t.startswith("添加用户"):
+            if not auth.can_manage_users(user):
+                return "⛔ 仅 admin 可添加用户"
+            # 添加用户 <open_id> <名> [角色] [初始资金]  — 角色缺省=trader（可交易）
             parts = t.split()
-            return _cmd_toggle(parts[1], t.startswith("停止")) if len(parts) > 1 else "缺代码"
+            if len(parts) < 3:
+                return "用法：添加用户 <open_id> <名字> [trader/viewer/admin] [初始资金]"
+            open_id_new = parts[1]
+            name_new = parts[2]
+            role_new = parts[3] if len(parts) > 3 and parts[3] in ("admin", "trader", "viewer") else "trader"
+            cash = float(parts[4]) if len(parts) > 4 else 100_000
+            _, msg = auth.create_user(open_id_new, name_new, role_new, cash)
+            auth.log_operation(user, "add_user", {"open_id": open_id_new, "role": role_new})
+            return msg
+
+        if t.startswith("删除用户"):
+            if not auth.can_manage_users(user):
+                return "⛔ 仅 admin 可删除用户"
+            parts = t.split()
+            if len(parts) < 2:
+                return "用法：删除用户 <id>"
+            msg = auth.block_user(int(parts[1]))
+            auth.log_operation(user, "block_user", {"target_id": parts[1]})
+            return msg
+
+        if t.startswith("设角色"):
+            if not auth.can_manage_users(user):
+                return "⛔ 仅 admin 可设置角色"
+            parts = t.split()
+            if len(parts) < 3:
+                return "用法：设角色 <id> <admin/trader/viewer>"
+            msg = auth.set_role(int(parts[1]), parts[2])
+            auth.log_operation(user, "set_role", {"target_id": parts[1], "role": parts[2]})
+            return msg
+
+        # ---- 通用 ----
+        if t in ("帮助", "help", "Help"):
+            help_text = "指令集：\n买入 000001 1000股｜买入 000001 20%\n卖出 000001 全部\n状态｜任务\n"
+            if role == "admin":
+                help_text += ("决策 000001 [深度]\n清仓｜停止巡逻 000001｜开始巡逻 000001\n"
+                              "用户列表｜添加用户 <open_id> <名字> [trader] [资金]\n"
+                              "删除用户 <id>｜设角色 <id> <角色>")
+            elif role == "viewer":
+                help_text = "（您的角色为 viewer：只能查询和消息分析，不能交易）"
+            return help_text
+
+        if t in ("状态",):
+            account_id = auth.get_trading_account_id(user)
+            result = _cmd_status_for(account_id)
+            auth.log_operation(user, "status", account_id=account_id)
+            return result
+
+        if t == "任务":
+            result = _cmd_tasks()
+            auth.log_operation(user, "tasks")
+            return result
+
+        # ---- admin 专属：巡逻/决策 ----
+        if t.startswith(("停止巡逻", "开始巡逻")):
+            if role != "admin":
+                return "⛔ 仅 admin 可控制巡逻"
+            parts = t.split()
+            result = _cmd_toggle(parts[1], t.startswith("停止")) if len(parts) > 1 else "缺代码"
+            auth.log_operation(user, "toggle_patrol", {"text": t[:50]})
+            return result
+
         if t.startswith("决策"):
+            if not auth.can_trigger_decision(user):
+                return "⛔ 仅 admin 可触发决策"
             parts = t.split()
             if len(parts) < 2:
                 return "用法：决策 000001 [深度]"
             deep = "深度" in t
             reply(chat_id, f"开始执行{'收盘深度' if deep else '盘中'}决策 {parts[1]}，完成后推送结果…")
+            auth.log_operation(user, "decision", {"code": parts[1], "deep": deep})
             threading.Thread(target=lambda: reply(chat_id, _cmd_decide(parts[1], deep)),
                              daemon=True).start()
             return None
+
+        # ---- 交易指令（admin + trader）----
         if t.startswith(("买入", "卖出")):
+            if not auth.can_trade(user):
+                auth.log_operation(user, "trade_denied", {"text": t[:50]})
+                return "⛔ 您的角色无交易权限"
+
             action = "buy" if t.startswith("买入") else "sell"
-            # 去掉指令词后取参数：支持 "买入 601689 1000股" / "买入601689 1000股" / "买入 601689 20%"
             toks = t[2:].strip().split()
             if not toks:
                 return "用法：买入/卖出 601689 [1000股|20%|全部]（缺省时买入按风控仓位、卖出全部）"
@@ -211,7 +325,7 @@ def handle_text(text: str, chat_id: str):
             spec = toks[1] if len(toks) > 1 else None
             qty = pct = None
             if spec is None:
-                pass  # 缺省：买入走风控默认仓位，卖出=全部
+                pass
             elif spec.replace("股", "").isdigit():
                 qty = int(spec.replace("股", ""))
             elif spec.endswith("%"):
@@ -220,6 +334,7 @@ def handle_text(text: str, chat_id: str):
                 qty = None
             else:
                 return "数量格式不对，示例：买入 601689 1000股 / 卖出 601689 20%"
+
             from ..utils import resolve_ts_code
             from ..db import SessionLocal
             db = SessionLocal()
@@ -227,8 +342,30 @@ def handle_text(text: str, chat_id: str):
                 code = resolve_ts_code(db, code) or code
             finally:
                 db.close()
-            return _cmd_trade(action, code, qty, pct)
-        return None  # 非指令 → 走自由对话（LLM 分析/问答）
+
+            # 路由到操作者的账户
+            account_id = auth.get_trading_account_id(user)
+            if not account_id:
+                return "⛔ 未找到可交易的账户，请联系管理员"
+            result = _cmd_trade(action, code, qty, pct, account_id=account_id)
+            auth.log_operation(user, f"{action}",
+                               {"code": code, "qty": qty, "pct": pct,
+                                "result": str(result)[:100]},
+                               account_id=account_id)
+            return result
+
+        if t == "清仓":
+            if not auth.can_trade(user):
+                return "⛔ 您的角色无清仓权限"
+            account_id = auth.get_trading_account_id(user)
+            result = _cmd_force_close(account_id=account_id)
+            auth.log_operation(user, "force_close", account_id=account_id)
+            return result
+
+        # ---- 自由对话（所有已授权角色）----
+        auth.log_operation(user, "chat", {"text_len": len(t)})
+        return None  # → 走 _cmd_chat
+
     except Exception as e:  # noqa: BLE001
         log.exception("飞书指令处理失败: %s", t)
         return f"指令执行出错：{e}"
@@ -295,20 +432,23 @@ def _cmd_chat(text: str, chat_id: str):
     threading.Thread(target=_job, name="feishu-chat", daemon=True).start()
 
 
-def _cmd_force_close() -> str:
+def _cmd_force_close(account_id: int | None = None) -> str:
     from ..db import SessionLocal
     from ..models import AgentConfig, SimAccount, SimPosition
     from .realtime import get_realtime
     from .agent.executor import execute_agent_order
     db = SessionLocal()
     try:
-        c = db.query(AgentConfig).first()
-        if not c:
-            return "尚未配置"
-        acc = db.get(SimAccount, c.account_id)
+        if account_id:
+            acc = db.get(SimAccount, account_id)
+        else:
+            c = db.query(AgentConfig).first()
+            acc = db.get(SimAccount, c.account_id) if c else None
+        if not acc:
+            return "未找到账户"
         out = []
         for p in db.scalars(select(SimPosition).where(
-                SimPosition.account_id == c.account_id)).all():
+                SimPosition.account_id == acc.id)).all():
             rt = get_realtime(p.ts_code) or {}
             px = rt.get("price")
             if not px:
@@ -359,8 +499,14 @@ def start_ws_client():
                 content = json.loads(msg.content)
                 text = content.get("text", "")
                 chat_id = msg.chat_id
-                log.info("飞书消息到达: chat=%s text=%r", chat_id, text[:80])
-                reply_text = handle_text(text, chat_id)
+                # 提取发送者 open_id（鉴权标识）
+                try:
+                    open_id = data.event.sender.sender_id.open_id or ""
+                except Exception:  # noqa: BLE001
+                    open_id = ""
+                log.info("飞书消息到达: chat=%s open_id=%s text=%r",
+                         chat_id, open_id, text[:80])
+                reply_text = handle_text(text, chat_id, open_id)
                 if reply_text:
                     reply(chat_id, reply_text)
                 else:

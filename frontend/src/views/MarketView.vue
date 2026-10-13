@@ -32,6 +32,16 @@
       </span>
     </el-card>
 
+    <el-card v-if="onboarding" shadow="never" class="onboarding">
+      <h3>👋 欢迎使用 Stock Analyst</h3>
+      <el-steps :active="1" align-center>
+        <el-step title="① 看行情" description="搜索任意A股代码（首次拉取需几秒）" />
+        <el-step title="② 生成AI分析" description="AI分析页选股生成研报+讨论" />
+        <el-step title="③ 建回放练习" description="回放交易页新建模拟练习" />
+      </el-steps>
+      <div class="onb-hint">提示：先在上方搜索框输入如 000001 开始体验</div>
+    </el-card>
+
     <el-card shadow="never" class="chart-card">
       <div ref="chartRef" class="chart" />
     </el-card>
@@ -46,6 +56,8 @@ import RealtimeQuoteBar from '../components/RealtimeQuoteBar.vue'
 import { api, getDaily, searchStocks, type StockInfo } from '../api'
 
 const selected = ref('')
+const onboarding = ref(true)
+watch(selected, v => { if (v) onboarding.value = false })
 const adjust = ref('qfq')
 const options = ref<StockInfo[]>([])
 const currentStock = ref<StockInfo | null>(null)
@@ -115,4 +127,7 @@ onBeforeUnmount(() => {
 .stock-title { font-size: 16px; font-weight: 600; }
 .chart-card { padding: 0; }
 .chart { width: 100%; height: 560px; }
+.onboarding { margin-bottom: 12px; }
+.onboarding h3 { margin: 0 0 16px; }
+.onb-hint { text-align: center; color: #909399; font-size: 13px; margin-top: 12px; }
 </style>

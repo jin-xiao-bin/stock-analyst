@@ -43,6 +43,27 @@ def notify(title: str, text: str = "", important: bool = False) -> bool:
         return False
 
 
+def notify_card(card: dict, important: bool = False) -> bool:
+    """发送飞书 interactive 卡片消息"""
+    url = settings.feishu_webhook_url
+    if not url:
+        return False
+    payload = {"msg_type": "interactive", "card": card}
+    params = {}
+    if settings.feishu_secret:
+        ts = int(time.time())
+        params = {"timestamp": ts, "sign": _sign(ts, settings.feishu_secret)}
+    try:
+        r = httpx.post(url, json={**payload, **params}, timeout=10)
+        ok = r.status_code == 200 and r.json().get("code", 0) == 0
+        if not ok:
+            log.warning("飞书卡片失败: %s %s", r.status_code, r.text[:150])
+        return ok
+    except Exception as e:  # noqa: BLE001
+        log.warning("飞书卡片异常(静默): %s", e)
+        return False
+
+
 def notify_test() -> dict:
     """配置页测试按钮"""
     if not settings.feishu_webhook_url:

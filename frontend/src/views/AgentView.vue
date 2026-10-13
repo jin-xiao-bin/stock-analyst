@@ -221,6 +221,14 @@
           </el-select>
           <div class="hint">agent 的所有自主决策将在该账户中执行；切换后历史决策流水保留</div>
         </el-form-item>
+        <el-form-item label="预设模板">
+          <el-select placeholder="一键填充风控参数与风格" style="width: 100%" @change="applyTemplate">
+            <el-option label="保守（低仓位/严熔断/长冷却）" value="conservative" />
+            <el-option label="平衡（默认推荐）" value="balanced_tpl" />
+            <el-option label="激进（高仓位/宽熔断/无冷却）" value="aggressive_tpl" />
+          </el-select>
+          <div class="hint">选择后自动填充下方风格与高级参数，可再手动微调</div>
+        </el-form-item>
         <el-form-item label="风格">
           <el-radio-group v-model="config.style">
             <el-radio-button value="steady">稳健</el-radio-button>
@@ -359,6 +367,29 @@ const config = reactive({
 })
 const allAccounts = ref<Account[]>([])
 const refRows = ref<{ ts: string; ids: string }[]>([])
+
+const TEMPLATES: Record<string, { style: string; freq: number; rp: Record<string, number> }> = {
+  conservative: { style: 'steady', freq: 120, rp: {
+    max_pos_pct: 15, max_trades_per_day: 3, max_drawdown_halt: 10, halt_days: 14,
+    loss_streak_limit: 5, cooldown_days: 3 } },
+  balanced_tpl: { style: 'steady', freq: 60, rp: {
+    max_pos_pct: 30, max_trades_per_day: 5, max_drawdown_halt: 15, halt_days: 10,
+    loss_streak_limit: 5, cooldown_days: 1 } },
+  aggressive_tpl: { style: 'aggressive', freq: 30, rp: {
+    max_pos_pct: 50, max_trades_per_day: 8, max_drawdown_halt: 20, halt_days: 5,
+    loss_streak_limit: 3, cooldown_days: 0 } },
+}
+
+const applyTemplate = (key: string) => {
+  const t = TEMPLATES[key]
+  if (!t) return
+  config.style = t.style
+  config.patrol_freq = t.freq
+  for (const [k, v] of Object.entries(t.rp)) {
+    config.risk_params[k] = v
+  }
+  ElMessage.success('模板已填充，可继续微调')
+}
 
 const detailVisible = ref(false)
 const detail = ref<AgentDecisionDetail | null>(null)

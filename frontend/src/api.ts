@@ -401,8 +401,13 @@ export interface BacktestResult {
   end_date?: string
   status: string
   error?: string
-  metrics?: BacktestMetrics
+  metrics?: BacktestMetrics & {
+    benchmark_return?: number
+    excess_return?: number
+    win_days_pct?: number
+  }
   equity_curve?: EquityPoint[]
+  benchmark_curve?: EquityPoint[]
   trades?: TradeRecord[]
 }
 

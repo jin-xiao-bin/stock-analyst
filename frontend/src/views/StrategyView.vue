@@ -295,14 +295,22 @@
             </el-card>
           </el-col>
         </el-row>
-        <h4>收益曲线（相对初始资金收益率；红B=买入 绿S=卖出）</h4>
+        <h4>收益曲线（相对初始资金收益率；红B=买入 绿S=卖出{{ btResult.benchmark_curve?.length ? '；灰线=沪深300基准' : '' }}）</h4>
         <CurveChart
           v-if="btResult.equity_curve?.length"
-          :series="[{
-            name: `#${btResult.id}`,
-            data: btResult.equity_curve ?? [],
-            initialCash: btResult.initial_cash ?? 1000000,
-          }]"
+          :series="[
+            {
+              name: `#${btResult.id}`,
+              data: btResult.equity_curve ?? [],
+              initialCash: btResult.initial_cash ?? 1000000,
+            },
+            ...(btResult.benchmark_curve?.length ? [{
+              name: '沪深300基准',
+              data: btResult.benchmark_curve ?? [],
+              initialCash: btResult.initial_cash ?? 1000000,
+              color: '#909399',
+            }] : []),
+          ]"
           :markers="(btResult.trades ?? []).map(t => ({ date: t.trade_date, side: t.side }))"
           :trades="btResult.trades ?? []"
         />
@@ -406,7 +414,7 @@ const btDetailMetrics = computed(() => {
   const m = btHistDetail.value?.metrics
   if (!m) return []
   const pct = (v: number) => `${(v * 100).toFixed(2)}%`
-  return [
+  const cards = [
     { label: '总收益', text: pct(m.total_return), up: m.total_return >= 0 },
     { label: '年化', text: pct(m.annual_return), up: m.annual_return >= 0 },
     { label: '最大回撤', text: pct(m.max_drawdown), up: false },
@@ -415,6 +423,13 @@ const btDetailMetrics = computed(() => {
     { label: '交易数', text: String(m.trade_count), up: undefined },
     { label: '盈亏比', text: m.profit_factor.toFixed(2), up: undefined },
   ]
+  if (m.benchmark_return !== undefined) {
+    cards.push({ label: '基准收益', text: pct(m.benchmark_return), up: m.benchmark_return >= 0 })
+  }
+  if (m.excess_return !== undefined) {
+    cards.push({ label: '超额收益', text: pct(m.excess_return), up: m.excess_return >= 0 })
+  }
+  return cards
 })
 
 // ---------- 聚宽导入 ----------
